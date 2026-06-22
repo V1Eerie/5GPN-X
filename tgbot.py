@@ -45,8 +45,8 @@ SERVICES = [
     "proxy-gateway-ios-profile",
     "proxy-gateway-tgbot",
 ]
-EXIT_NAME_RE = re.compile(r"^(local|[a-z0-9]{1,11})$")
-EXIT_ADD_NAME_RE = re.compile(r"^[a-z0-9]{1,11}$")  # 'local' is reserved
+EXIT_NAME_RE = re.compile(r"^(local|[\w\-\u4e00-\u9fff]{1,16})$", re.UNICODE)
+EXIT_ADD_NAME_RE = re.compile(r"^[\w\-\u4e00-\u9fff]{1,16}$", re.UNICODE)  # 'local' is reserved
 WWW_DIR = "/opt/proxy-gateway/www"
 
 # Per-chat conversational state for multi-step flows (e.g. add-exit).

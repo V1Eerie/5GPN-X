@@ -1645,7 +1645,12 @@ list_exits() {
 add_exit() {
     local name="${1:-}" src="${2:-}"
     [[ -z "$name" ]] && { err "Usage: $0 --add-exit <name> [wg.conf | socks5://... | ss://...]"; exit 1; }
-    [[ "$name" =~ ^[a-z0-9]{1,11}$ ]] || { err "Exit name must be 1-11 lowercase letters/digits"; exit 1; }
+    python3 - "$name" <<'PYNAME' || { err "Exit name must be 1-16 letters/digits/Chinese characters/_/-"; exit 1; }
+import re, sys
+name = sys.argv[1]
+if name in ("local", "smart") or not re.match(r"^[\w\-\u4e00-\u9fff]{1,16}$", name, re.UNICODE):
+    raise SystemExit(1)
+PYNAME
     [[ "$name" == "local" || "$name" == "smart" ]] && { err "'$name' is a reserved exit name (smart = rule-based router; use --set-rules)"; exit 1; }
 
     mkdir -p "${WG_DIR}"; chmod 700 "${WG_DIR}"

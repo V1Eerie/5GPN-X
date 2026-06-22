@@ -61,13 +61,15 @@ def b64decode_any(s):
 
 def parse_hostport(s):
     s = s.strip()
+    # Ignore accidental URI tail/comments after the host:port portion.
+    s = re.split(r"[/?#]", s, 1)[0].strip()
     # [v6]:port
     m = re.match(r"^\[(.+)\]:(\d+)$", s)
     if m:
         return m.group(1), int(m.group(2))
-    if s.count(":") == 1:
-        host, port = s.rsplit(":", 1)
-        return host, int(port)
+    m = re.match(r"^(.+):(\d+)$", s)
+    if m:
+        return m.group(1), int(m.group(2))
     die("cannot parse host:port from %r" % s)
 
 
@@ -124,6 +126,7 @@ def parse_socks(uri):
         userinfo, hostport = rest.rsplit("@", 1)
     else:
         userinfo, hostport = "", rest
+    hostport = re.split(r"[/?#]", hostport, 1)[0].strip()
     host, port = parse_hostport(hostport)
     user = password = None
     if userinfo:
@@ -140,7 +143,7 @@ def main():
     if len(sys.argv) != 3:
         die("usage: singbox-exit-config.py <name> <uri>")
     name, uri = sys.argv[1], sys.argv[2].strip()
-    if not re.match(r"^[a-z0-9]{1,11}$", name) or name == "local":
+    if not re.match(r"^[\w\-\u4e00-\u9fff]{1,16}$", name, re.UNICODE) or name == "local":
         die("invalid exit name")
 
     # gvisor (userspace netstack) is the reliable tun2socks stack; the "system"
