@@ -31,6 +31,10 @@ fail() { echo "$1" >&2; exit 1; }
 
 # --- swap safety net ---------------------------------------------------------
 [[ "${install_body}" == *'mkswap /swapfile'* ]] || fail "low-memory mode must be able to create swap"
+[[ "${install_body}" == *'请输入 swap 大小（如 0.5/1/2 或 0.5G/1G/2G，回车默认 1）'* ]] || fail "installer must prompt for interactive swap size input"
+[[ "${install_body}" == *'swap_size_to_bytes()'* ]] || fail "installer must convert swap size strings into bytes"
+[[ "${install_body}" == *'input="${input}G"'* ]] || fail "numeric swap input must default to GiB units"
+[[ "${install_body}" == *'fallocate -l "$swap_bytes" /swapfile'* ]] || fail "swap allocation must use the requested size"
 [[ "${install_body}" == *'make -j"${MAKE_JOBS:-$(nproc)}"'* ]] || fail "compile must respect the bounded job count"
 
 # --- iOS server must be socket-activated (zero idle process) -----------------

@@ -306,6 +306,27 @@ detect_memory_profile() {
 }
 
 # On low-memory hosts, make sure some swap exists before we compile / run.
+swap_size_to_bytes() {
+    python3 -c 'import re, sys; raw = sys.argv[1].strip().upper(); raw = raw if raw.endswith("G") else (raw + "G" if raw else raw); m = re.fullmatch(r"([0-9]+(?:\\.[0-9]+)?)G", raw); print(0 if not m else int(float(m.group(1)) * 1024 * 1024 * 1024))' "$1"
+}
+
+prompt_swap_size() {
+    local input="${SWAP_SIZE:-}"
+    if [[ -z "$input" && -t 0 ]]; then
+        read -r -p "请输入 swap 大小（如 0.5/1/2 或 0.5G/1G/2G，回车默认 1）: " input || true
+    fi
+    input="${input:-1}"
+    input="${input^^}"
+    if [[ "$input" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        input="${input}G"
+    fi
+    if [[ ! "$input" =~ ^[0-9]+(\.[0-9]+)?G$ ]]; then
+        warn "无效的 swap 大小：${input}，已回退到 1G。"
+        input="1G"
+    fi
+    printf '%s' "$input"
+}
+
 ensure_swap() {
     [[ "${LOWMEM:-0}" == "1" ]] || return 0
     # /proc/swaps has a header line; >1 line means swap is already active.
@@ -314,16 +335,27 @@ ensure_swap() {
         return 0
     fi
     [[ -e /swapfile ]] && return 0
-    # Need enough free space for a 1G swapfile (require ~1.5G headroom).
-    local avail_mb
+
+    local swap_size swap_bytes swap_mib required_mb avail_mb
+    swap_size="$(prompt_swap_size)"
+    swap_bytes="$(swap_size_to_bytes "$swap_size")"
+    if [[ "$swap_bytes" -le 0 ]]; then
+        warn "无法解析 swap 大小，已回退到 1G。"
+        swap_size="1G"
+        swap_bytes="$(swap_size_to_bytes "$swap_size")"
+    fi
+    swap_mib=$(( (swap_bytes + 1024 * 1024 - 1) / 1024 / 1024 ))
+    required_mb=$(( (swap_mib * 3 + 1) / 2 ))
+
     avail_mb=$(df -Pm / | awk 'NR==2 {print $4}')
-    if [[ -z "$avail_mb" || "$avail_mb" -lt 1536 ]]; then
-        warn "Not enough free disk for a swapfile (${avail_mb:-?}MB free); skipping."
+    if [[ -z "$avail_mb" || "$avail_mb" -lt "$required_mb" ]]; then
+        warn "Not enough free disk for a ${swap_size} swapfile (${avail_mb:-?}MB free, need ~${required_mb}MB); skipping."
         return 0
     fi
-    info "Creating 1G swapfile to avoid OOM on this low-memory host..."
-    if ! fallocate -l 1G /swapfile 2>/dev/null; then
-        dd if=/dev/zero of=/swapfile bs=1M count=1024 status=none 2>/dev/null || {
+
+    info "Creating ${swap_size} swapfile to avoid OOM on this low-memory host..."
+    if ! fallocate -l "$swap_bytes" /swapfile 2>/dev/null; then
+        dd if=/dev/zero of=/swapfile bs=1M count="$swap_mib" status=none 2>/dev/null || {
             warn "Failed to allocate swapfile; continuing without swap."; rm -f /swapfile; return 0; }
     fi
     chmod 600 /swapfile
@@ -332,7 +364,7 @@ ensure_swap() {
     if ! grep -q '^/swapfile ' /etc/fstab 2>/dev/null; then
         echo '/swapfile none swap sw 0 0' >> /etc/fstab
     fi
-    ok "1G swapfile active."
+    ok "${swap_size} swapfile active."
 }
 
 get_public_ip() {
