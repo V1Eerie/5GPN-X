@@ -380,19 +380,13 @@ func raceQuery(query []byte, upstreams []string, timeout time.Duration) ([]byte,
 	}
 
 	results := make(chan result, len(upstreams))
-	ctx := &raceContext{
-		query:    query,
-		upstreams: upstreams,
-		results:  results,
-		timeout:  timeout,
-	}
 
 	// Fire all queries in parallel
 	for _, upstream := range upstreams {
 		upstream := upstream
 		go func() {
-			resp, err := queryUDPUpstream(ctx.query, upstream, ctx.timeout)
-			if err != nil || !validDNSResponse(ctx.query, resp) {
+			resp, err := queryUDPUpstream(query, upstream, timeout)
+			if err != nil || !validDNSResponse(query, resp) {
 				results <- result{err: err}
 				return
 			}
@@ -419,18 +413,6 @@ func raceQuery(query []byte, upstreams []string, timeout time.Duration) ([]byte,
 			return nil, errors.New("all upstreams timed out")
 		}
 	}
-}
-
-type raceContext struct {
-	query     []byte
-	upstreams []string
-	results   chan result
-	timeout   time.Duration
-}
-
-type result struct {
-	data []byte
-	err  error
 }
 
 func queryUDPUpstream(query []byte, upstream string, timeout time.Duration) ([]byte, error) {
