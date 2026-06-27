@@ -10,7 +10,7 @@ set -euo pipefail
 # =============================================================================
 # Configurable defaults
 # =============================================================================
-REPO_URL="https://github.com/Xiuyixx/5GPN-X.git"
+REPO_URL="https://github.com/V1Eerie/5GPN-X.git"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT_PATH="${SCRIPT_DIR}/$(basename "$0")"
 BASE_DIR="/opt/proxy-gateway"

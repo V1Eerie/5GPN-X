@@ -7,7 +7,7 @@
 一键安装(交互输入你自己的域名):
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/Xiuyixx/5GPN-X/main/install.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/V1Eerie/5GPN-X/main/install.sh)"
 ```
 
 ## 思路
