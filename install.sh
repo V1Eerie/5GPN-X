@@ -45,7 +45,8 @@ DEFAULT_PUBLIC_OVERSEAS_DNS=("1.1.1.1" "8.8.8.8")
 
 bootstrap_from_repo_if_needed() {
     local required=(
-        install.sh renew-hook.sh sniproxy.conf quic-proxy.go china-dns-race-proxy.go
+        install.sh renew-hook.sh sniproxy.conf quic-proxy.go china-dns-race-proxy.go \
+            overseas-dns-geoip-check.go
         dnsdist.conf.template update-rules.sh ios-http.py tgbot.py rules-import.py
         singbox-exit-config.py singbox-router-config.py rules-default.conf
     )
@@ -720,74 +721,79 @@ verify_domain_dns() {
 # Let's Encrypt Certificate
 # =============================================================================
 install_cert() {
-    local certbot_cmd certbot_cmd_force
     install_certbot_firewall_hooks
 
-    # Normal issuance (first time) - no force-renewal to avoid rate limits
-    certbot_cmd=(certbot certonly --standalone -d "$DOMAIN" \
-        --agree-tos -n -m "${EMAIL:-admin@${DOMAIN}}" \
-        --pre-hook /usr/local/bin/proxy-gateway-open-cert-http.sh \
-        --post-hook /usr/local/bin/proxy-gateway-restore-firewall.sh)
-    # Reinstall / explicit renew - force renewal
-    certbot_cmd_force=(certbot certonly --standalone -d "$DOMAIN" --force-renewal \
-        --agree-tos -n -m "${EMAIL:-admin@${DOMAIN}}" \
-        --pre-hook /usr/local/bin/proxy-gateway-open-cert-http.sh \
-        --post-hook /usr/local/bin/proxy-gateway-restore-firewall.sh)
+    local cert_live_dir="/etc/letsencrypt/live/${DOMAIN}"
+    local dnsdist_cert="/etc/dnsdist/certs/fullchain.pem"
+    local dnsdist_key="/etc/dnsdist/certs/privkey.pem"
 
-    local cb_cmd=()
-    if [[ -d "/etc/letsencrypt/live/${DOMAIN}" ]]; then
-        info "Let's Encrypt certificate already exists for $DOMAIN, forcing renewal..."
-        cb_cmd=("${certbot_cmd_force[@]}")
+    # Reuse existing certificate if both LE live dir AND dnsdist copy exist
+    if [[ -f "${cert_live_dir}/fullchain.pem" && -f "${dnsdist_cert}" ]]; then
+        ok "证书已存在，直接复用（跳过 certbot，避免 LE 速率限制）"
+        # Ensure dnsdist cert directory exists and permissions are correct
+        mkdir -p /etc/dnsdist/certs
+        chown -R _dnsdist:_dnsdist /etc/dnsdist/certs/
+        chmod 640 "${dnsdist_cert}" "${dnsdist_key}" 2>/dev/null || true
     else
         info "申请 Let's Encrypt 证书 for $DOMAIN..."
-        cb_cmd=("${certbot_cmd[@]}")
-    fi
 
-    run_certbot() {
-        open_cert_http_port
-        trap restore_reverse_proxy_firewall RETURN
-        # Run certbot ONCE and capture output, so we never re-issue just to probe
-        # the error (that wastes Let's Encrypt rate-limit attempts). The `if`
-        # keeps the failing run from tripping `set -e` before we can handle it.
-        local out rc
-        if out="$("${cb_cmd[@]}" 2>&1)"; then rc=0; else rc=$?; fi
-        printf '%s\n' "$out"
-        if [[ $rc -eq 0 ]]; then
-            return 0
+        run_certbot() {
+            open_cert_http_port
+            trap restore_reverse_proxy_firewall RETURN
+            # Run certbot ONCE so we never re-issue just to probe the error
+            # (that wastes LE rate-limit attempts).
+            local out rc cmd
+            if [[ -d "$cert_live_dir" ]]; then
+                # LE dir exists but dnsdist copy is missing → force-renew to recreate
+                cmd=(certbot certonly --standalone -d "$DOMAIN" --force-renewal \
+                    --agree-tos -n -m "${EMAIL:-admin@${DOMAIN}}" \
+                    --pre-hook /usr/local/bin/proxy-gateway-open-cert-http.sh \
+                    --post-hook /usr/local/bin/proxy-gateway-restore-firewall.sh)
+                info "证书目录存在但 dnsdist 副本缺失，强制续期..."
+            else
+                cmd=(certbot certonly --standalone -d "$DOMAIN" \
+                    --agree-tos -n -m "${EMAIL:-admin@${DOMAIN}}" \
+                    --pre-hook /usr/local/bin/proxy-gateway-open-cert-http.sh \
+                    --post-hook /usr/local/bin/proxy-gateway-restore-firewall.sh)
+            fi
+            if out="$("${cmd[@]}" 2>&1)"; then rc=0; else rc=$?; fi
+            printf '%s\n' "$out"
+            if [[ $rc -eq 0 ]]; then
+                return 0
+            fi
+            # Retry once only on the known Python (3.12+) compatibility error.
+            if grep -q "AttributeError" <<<"$out"; then
+                warn "Certbot compatibility error detected. Attempting to fix Python dependencies..."
+                pip3 install --upgrade --break-system-packages certbot josepy cryptography 2>/dev/null || \
+                    pip3 install --upgrade certbot josepy cryptography 2>/dev/null || true
+                info "Retrying certificate request..."
+                "${cmd[@]}"
+                return $?
+            fi
+            return 1
+        }
+
+        if ! run_certbot; then
+            err "证书申请失败。请检查:"
+            err "  1. 域名 $DOMAIN 是否正确解析到本机 ($PUBLIC_IP)"
+            err "  2. 端口 80 是否被占用"
+            err "  3. 防火墙是否放行 80"
+            err "  4. 是否触发了 Let's Encrypt 速率限制 (同一域名 7 天内限 5 次)"
+            exit 1
         fi
-        # Retry once only on the known Python (3.12+) compatibility error.
-        if grep -q "AttributeError" <<<"$out"; then
-            warn "Certbot compatibility error detected. Attempting to fix Python dependencies..."
-            pip3 install --upgrade --break-system-packages certbot josepy cryptography 2>/dev/null || \
-                pip3 install --upgrade certbot josepy cryptography 2>/dev/null || true
-            info "Retrying certificate request..."
-            "${cb_cmd[@]}"
-            return $?
+
+        # Copy certificates to dnsdist-readable location
+        info "Copying certificates to /etc/dnsdist/certs/ ..."
+        if [[ -d "$cert_live_dir" ]]; then
+            mkdir -p /etc/dnsdist/certs
+            cp "${cert_live_dir}/fullchain.pem" "${dnsdist_cert}"
+            cp "${cert_live_dir}/privkey.pem" "${dnsdist_key}"
+            chown -R _dnsdist:_dnsdist /etc/dnsdist/certs/
+            chmod 640 "${dnsdist_cert}" "${dnsdist_key}"
+            ok "Certificates copied to /etc/dnsdist/certs/"
+        else
+            warn "Could not find certificate live directory: $cert_live_dir"
         fi
-        return 1
-    }
-
-    if ! run_certbot; then
-        err "证书申请失败。请检查:"
-        err "  1. 域名 $DOMAIN 是否正确解析到本机 ($PUBLIC_IP)"
-        err "  2. 端口 80 是否被占用"
-        err "  3. 防火墙是否放行 80"
-        err "  4. 是否触发了 Let's Encrypt 速率限制 (同一域名 7 天内限 5 次)"
-        exit 1
-    fi
-
-    # Copy certificates to dnsdist-readable location
-    info "Copying certificates to /etc/dnsdist/certs/ ..."
-    local cert_live_dir="/etc/letsencrypt/live/${DOMAIN}"
-    if [[ -d "$cert_live_dir" ]]; then
-        mkdir -p /etc/dnsdist/certs
-        cp "${cert_live_dir}/fullchain.pem" /etc/dnsdist/certs/fullchain.pem
-        cp "${cert_live_dir}/privkey.pem" /etc/dnsdist/certs/privkey.pem
-        chown -R _dnsdist:_dnsdist /etc/dnsdist/certs/
-        chmod 640 /etc/dnsdist/certs/*.pem
-        ok "Certificates copied to /etc/dnsdist/certs/"
-    else
-        warn "Could not find certificate live directory: $cert_live_dir"
     fi
 
     # Deploy renewal hook (also handles cert copy on renewal)
@@ -940,6 +946,98 @@ EOF
 }
 
 # =============================================================================
+# Overseas DNS GeoIP check proxy (DNS spoofing for non-China IPs)
+# =============================================================================
+install_overseas_geoip_proxy() {
+    info "Compiling overseas-dns-geoip-check (GeoIP DNS check proxy)..."
+
+    # Ensure Go can download modules
+    export GOPATH="${BASE_DIR}/.gopath"
+    mkdir -p "${GOPATH}"
+    mkdir -p "${BASE_DIR}/bin"
+    mkdir -p "${SRC_DIR}"
+    cp "${SCRIPT_DIR}/overseas-dns-geoip-check.go" "${SRC_DIR}/overseas-dns-geoip-check.go"
+    cd "${SRC_DIR}"
+
+    export PATH=$PATH:/usr/local/go/bin
+    # Initialize go module if not present (first time) or work with existing
+    if [[ ! -f "go.mod" ]]; then
+        go mod init proxy-gateway-geoip-dns 2>/dev/null || true
+    fi
+    go mod tidy 2>/dev/null || true
+    go build -ldflags="-s -w" -o "${BASE_DIR}/bin/overseas-dns-geoip-check" overseas-dns-geoip-check.go
+
+    # Download geoip-cn.db if not already present
+    local geoip_db="/etc/dnsdist/geoip-cn.db"
+    if [[ ! -f "${geoip_db}" ]]; then
+        info "Downloading geoip-cn.db..."
+        download_geoip_db "${geoip_db}" || warn "geoip-cn.db download failed, will retry later"
+    fi
+
+    cat > /etc/systemd/system/overseas-dns-geoip-check.service <<'EOF'
+[Unit]
+Description=Overseas DNS GeoIP check proxy
+Description=zh-CN=海外 DNS GeoIP 检查代理（非中国 IP 返回本机 IP）
+After=network.target
+Before=dnsdist.service
+
+[Service]
+Type=simple
+ExecStart=/opt/proxy-gateway/bin/overseas-dns-geoip-check \
+    -l 127.0.0.1:5302 \
+    -geoip-db /etc/dnsdist/geoip-cn.db \
+    -spoof-ip __SPOOF_IP__ \
+    -upstreams __OVERSEAS_DNS_UPSTREAMS__
+Restart=on-failure
+RestartSec=3
+User=root
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable overseas-dns-geoip-check
+    ok "overseas-dns-geoip-check installed"
+}
+
+download_geoip_db() {
+    local dest="$1"
+    local url="https://github.com/SagerNet/sing-geoip/releases/latest/download/geoip-cn.db"
+    mkdir -p "$(dirname "${dest}")"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL -o "${dest}" "${url}" 2>/dev/null && return 0
+    fi
+    if command -v wget >/dev/null 2>&1; then
+        wget -qO "${dest}" "${url}" 2>/dev/null && return 0
+    fi
+    return 1
+}
+
+configure_overseas_geoip_service() {
+    local geoip_db="/etc/dnsdist/geoip-cn.db"
+    local service_file="/etc/systemd/system/overseas-dns-geoip-check.service"
+
+    # Combine all overseas DNS into one list for the proxy
+    local private_dns public_dns all_dns
+    private_dns=$(cat /etc/dnsdist/.overseas_private_dns 2>/dev/null || cat /etc/dnsdist/.overseas_dns 2>/dev/null || echo "1.1.1.1")
+    public_dns=$(cat /etc/dnsdist/.overseas_public_dns 2>/dev/null || echo "8.8.8.8")
+
+    # Merge and deduplicate
+    all_dns=$(echo "${private_dns},${public_dns}" | tr ',' '\n' | tr ' ' '\n' | awk '!seen[$0]++' | paste -sd ',' -)
+    [[ -z "${all_dns}" ]] && all_dns="1.1.1.1,8.8.8.8"
+
+    local spoof_ip
+    spoof_ip=$(cat /etc/dnsdist/.public_ip 2>/dev/null || echo "")
+
+    # Update the ExecStart line with the correct upstreams and spoof IP
+    sed -i "s|__SPOOF_IP__|${spoof_ip}|g; s|__OVERSEAS_DNS_UPSTREAMS__|${all_dns}|g" "${service_file}" 2>/dev/null || true
+
+    systemctl daemon-reload
+}
+
+# =============================================================================
 # dnsdist (DoT + Smart DNS)
 # =============================================================================
 install_dnsdist() {
@@ -949,6 +1047,8 @@ install_dnsdist() {
     cp "${SCRIPT_DIR}/dnsdist.conf.template" /etc/dnsdist/dnsdist.conf.template
     cp "${SCRIPT_DIR}/update-rules.sh" /usr/local/bin/update-dnsdist-rules.sh
     chmod +x /usr/local/bin/update-dnsdist-rules.sh
+    cp "${SCRIPT_DIR}/update-geoip-db.sh" /usr/local/bin/update-geoip-db.sh
+    chmod +x /usr/local/bin/update-geoip-db.sh
 
     # Save domain and IP for template generation
     echo "$DOMAIN" > /etc/dnsdist/.domain
@@ -959,9 +1059,6 @@ install_dnsdist() {
     echo "$SNIPROXY_DNS" > /etc/dnsdist/.sniproxy_dns
     # Persist the packet-cache size so weekly rule updates keep the same value.
     echo "${PACKET_CACHE_SIZE:-500000}" > /etc/dnsdist/.cache_size
-    local overseas_private_servers overseas_public_servers
-    overseas_private_servers=$(render_overseas_dns_servers "$PRIVATE_OVERSEAS_DNS" "overseas_private" "overseas_private")
-    overseas_public_servers=$(render_overseas_dns_servers "$PUBLIC_OVERSEAS_DNS" "overseas_public" "overseas_public")
 
     # Determine actual certificate directory name
     local cert_basename="${DOMAIN}"
@@ -970,7 +1067,9 @@ install_dnsdist() {
     fi
 
     # Generate initial config (empty rules, will be populated by update-rules.sh)
-    python3 - /etc/dnsdist/dnsdist.conf.template "${PUBLIC_IP}" "${cert_basename}" "$overseas_private_servers" "$overseas_public_servers" "${PACKET_CACHE_SIZE:-500000}" /etc/dnsdist/dnsdist.conf <<'PYEOF'
+    # Note: __OVERSEAS_PRIVATE_DNS_SERVERS__ / __OVERSEAS_PUBLIC_DNS_SERVERS__ removed;
+    # overseas DNS is now handled by overseas-dns-geoip-check proxy (127.0.0.1:5302).
+    python3 - /etc/dnsdist/dnsdist.conf.template "${PUBLIC_IP}" "${cert_basename}" "${PACKET_CACHE_SIZE:-500000}" /etc/dnsdist/dnsdist.conf <<'PYEOF'
 import sys
 with open(sys.argv[1], "r", encoding="utf-8") as f:
     content = f.read()
@@ -978,10 +1077,8 @@ content = content.replace("__GFWLIST_RULES__", "-- (rules will be loaded by upda
 content = content.replace("__CHINALIST_RULES__", "-- (rules will be loaded by update-rules.sh)")
 content = content.replace("__SERVER_IP__", sys.argv[2])
 content = content.replace("__DOMAIN__", sys.argv[3])
-content = content.replace("__OVERSEAS_PRIVATE_DNS_SERVERS__", sys.argv[4])
-content = content.replace("__OVERSEAS_PUBLIC_DNS_SERVERS__", sys.argv[5])
-content = content.replace("__PACKET_CACHE_SIZE__", sys.argv[6])
-with open(sys.argv[7], "w", encoding="utf-8") as f:
+content = content.replace("__PACKET_CACHE_SIZE__", sys.argv[4])
+with open(sys.argv[5], "w", encoding="utf-8") as f:
     f.write(content)
 PYEOF
 
@@ -2266,7 +2363,32 @@ EOF
     # Ensure certbot timer is enabled
     systemctl enable --now certbot.timer 2>/dev/null || true
 
-    ok "Schedules configured (rules: weekly, cert: auto)"
+    # Monthly geoip-cn.db update (1st day of month 03:30)
+    cat > /etc/systemd/system/update-geoip-db.timer <<'EOF'
+[Unit]
+Description=Monthly geoip-cn.db update
+
+[Timer]
+OnCalendar=*-*-01 03:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    cat > /etc/systemd/system/update-geoip-db.service <<'EOF'
+[Unit]
+Description=Update geoip-cn.db for overseas-dns-geoip-check
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/update-geoip-db.sh
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now update-geoip-db.timer 2>/dev/null || true
+
+    ok "Schedules configured (rules: weekly, geoip: monthly, cert: auto)"
 }
 
 # =============================================================================
@@ -2329,14 +2451,15 @@ do_uninstall() {
     done
     shopt -u nullglob
 
-    systemctl stop dnsdist sniproxy quic-proxy china-dns-race-proxy proxy-gateway-ios-profile.socket proxy-gateway-ios-profile proxy-gateway-exit proxy-gateway-tgbot proxy-gateway-api 2>/dev/null || true
-    systemctl disable dnsdist sniproxy quic-proxy china-dns-race-proxy proxy-gateway-ios-profile.socket proxy-gateway-ios-profile proxy-gateway-exit proxy-gateway-tgbot proxy-gateway-api 2>/dev/null || true
-    rm -f /etc/systemd/system/{sniproxy,quic-proxy,china-dns-race-proxy,proxy-gateway-ios-profile,update-dnsdist-rules,proxy-gateway-exit,proxy-gateway-tgbot,proxy-gateway-api}.*
+    systemctl stop dnsdist sniproxy quic-proxy china-dns-race-proxy overseas-dns-geoip-check proxy-gateway-ios-profile.socket proxy-gateway-ios-profile proxy-gateway-exit proxy-gateway-tgbot proxy-gateway-api 2>/dev/null || true
+    systemctl disable dnsdist sniproxy quic-proxy china-dns-race-proxy overseas-dns-geoip-check proxy-gateway-ios-profile.socket proxy-gateway-ios-profile proxy-gateway-exit proxy-gateway-tgbot proxy-gateway-api 2>/dev/null || true
+    rm -f /etc/systemd/system/{sniproxy,quic-proxy,china-dns-race-proxy,overseas-dns-geoip-check,proxy-gateway-ios-profile,update-dnsdist-rules,proxy-gateway-exit,proxy-gateway-tgbot,proxy-gateway-api}.*
     rm -f /etc/systemd/system/proxy-gateway-ios-profile@.service /etc/systemd/system/proxy-gateway-singbox@.service
-    rm -rf /etc/systemd/system/quic-proxy.service.d /etc/systemd/system/china-dns-race-proxy.service.d
+    rm -f /etc/systemd/system/update-geoip-db.{timer,service}
+    rm -rf /etc/systemd/system/quic-proxy.service.d /etc/systemd/system/china-dns-race-proxy.service.d /etc/systemd/system/overseas-dns-geoip-check.service.d
     systemctl daemon-reload
 
-    rm -rf "$BASE_DIR" /etc/sniproxy.conf /etc/dnsdist /usr/local/bin/update-dnsdist-rules.sh
+    rm -rf "$BASE_DIR" /etc/sniproxy.conf /etc/dnsdist /usr/local/bin/update-dnsdist-rules.sh /usr/local/bin/update-geoip-db.sh
     rm -f /usr/local/sbin/sniproxy
     rm -f /usr/local/bin/proxy-gateway-apply-exit.sh
     rm -f "${WG_DIR}"/pgw-*.conf
@@ -2455,7 +2578,9 @@ main_install() {
     install_sniproxy
     install_quic_proxy
     install_china_dns_race_proxy
+    install_overseas_geoip_proxy
     install_dnsdist
+    configure_overseas_geoip_service
     init_rules
     system_tuning
     setup_firewall
@@ -2508,6 +2633,7 @@ case "${1:-}" in
         show_status
         ;;
     --update-rules)
+        /usr/local/bin/update-geoip-db.sh 2>/dev/null || true
         /usr/local/bin/update-dnsdist-rules.sh
         ;;
     --renew-cert)

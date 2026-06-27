@@ -298,24 +298,18 @@ CERT_BASENAME="${DOMAIN}"
 if [[ -f "/opt/proxy-gateway/etc/.cert_basename" ]]; then
     CERT_BASENAME=$(cat "/opt/proxy-gateway/etc/.cert_basename")
 fi
-PRIVATE_OVERSEAS_DNS=$(cat "${BASE_DIR}/.overseas_private_dns" 2>/dev/null || cat "${BASE_DIR}/.overseas_dns" 2>/dev/null || echo "${DEFAULT_OVERSEAS_DNS[*]}")
-PUBLIC_OVERSEAS_DNS=$(cat "${BASE_DIR}/.overseas_public_dns" 2>/dev/null || echo "${DEFAULT_PUBLIC_OVERSEAS_DNS[*]}")
-OVERSEAS_PRIVATE_DNS_SERVERS=$(render_overseas_dns_servers "$PRIVATE_OVERSEAS_DNS" "overseas_private" "overseas_private")
-OVERSEAS_PUBLIC_DNS_SERVERS=$(render_overseas_dns_servers "$PUBLIC_OVERSEAS_DNS" "overseas_public" "overseas_public")
 PACKET_CACHE_SIZE=$(cat "${BASE_DIR}/.cache_size" 2>/dev/null || echo "500000")
 [[ "${PACKET_CACHE_SIZE}" =~ ^[0-9]+$ ]] || PACKET_CACHE_SIZE=500000
 
-python3 - "${DNSDIST_TEMPLATE}" "${GFWLIST_LUA}" "${CHINALIST_LUA}" "${SERVER_IP}" "${CERT_BASENAME}" "${OVERSEAS_PRIVATE_DNS_SERVERS}" "${OVERSEAS_PUBLIC_DNS_SERVERS}" "${PACKET_CACHE_SIZE}" "${DNSDIST_CONF}" <<'PYEOF'
+python3 - "${DNSDIST_TEMPLATE}" "${GFWLIST_LUA}" "${CHINALIST_LUA}" "${SERVER_IP}" "${CERT_BASENAME}" "${PACKET_CACHE_SIZE}" "${DNSDIST_CONF}" <<'PYEOF'
 import sys
 template_path = sys.argv[1]
 gfw_path = sys.argv[2]
 china_path = sys.argv[3]
 server_ip = sys.argv[4]
 domain = sys.argv[5]
-overseas_private_servers = sys.argv[6]
-overseas_public_servers = sys.argv[7]
-packet_cache_size = sys.argv[8]
-output_path = sys.argv[9]
+packet_cache_size = sys.argv[6]
+output_path = sys.argv[7]
 with open(template_path, "r", encoding="utf-8") as f:
     content = f.read()
 with open(gfw_path, "r", encoding="utf-8") as f:
@@ -330,12 +324,15 @@ content = content.replace("__GFWLIST_RULES__", gfw_rules)
 content = content.replace("__CHINALIST_RULES__", china_rules)
 content = content.replace("__SERVER_IP__", server_ip)
 content = content.replace("__DOMAIN__", domain)
-content = content.replace("__OVERSEAS_PRIVATE_DNS_SERVERS__", overseas_private_servers)
-content = content.replace("__OVERSEAS_PUBLIC_DNS_SERVERS__", overseas_public_servers)
 content = content.replace("__PACKET_CACHE_SIZE__", packet_cache_size)
 with open(output_path, "w", encoding="utf-8") as f:
     f.write(content)
 PYEOF
+
+# Also restart the geoip check proxy to pick up the updated DB
+if systemctl is-active --quiet overseas-dns-geoip-check 2>/dev/null; then
+    systemctl reload-or-restart overseas-dns-geoip-check 2>/dev/null || systemctl restart overseas-dns-geoip-check 2>/dev/null || true
+fi
 
 echo "[OK]   dnsdist configuration generated"
 

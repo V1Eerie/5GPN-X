@@ -25,9 +25,18 @@ addTLSLocal("0.0.0.0:853", certPath, keyPath, {
 -- parallel, then falls back if they are unreachable from this server.
 newServer({address="127.0.0.1:5301", pool="china", name="china_dns_race", order=1, useClientSubnet=true})
 
--- Overseas DNS Pools (selected by source network)
-__OVERSEAS_PRIVATE_DNS_SERVERS__
-__OVERSEAS_PUBLIC_DNS_SERVERS__
+-- Overseas DNS GeoIP Check Proxy (127.0.0.1:5302)
+--
+-- Queries overseas DNS upstreams, then checks resolved A records against
+-- geoip-cn.db (MMDB format, from SagerNet/sing-geoip). If ANY resolved IP
+-- is NOT in the China geoip database, the proxy returns this server's IP
+-- (DNS spoofing / hijacking). That causes the client's traffic to enter
+-- the transparent proxy. If ALL resolved IPs are in China, the normal
+-- response is returned so the client connects directly.
+--
+-- The overseas DNS servers to query are configured on the proxy itself
+-- (command-line -upstreams), not in dnsdist.
+newServer({address="127.0.0.1:5302", pool="overseas", name="overseas_geoip_check", order=1, useClientSubnet=true})
 
 -- =============================================================================
 -- ACL & Rate Limiting
@@ -78,13 +87,18 @@ addAction(LuaRule(function(dq) return chinaList:check(dq.qname) end), SetECSOver
 addAction(LuaRule(function(dq) return chinaList:check(dq.qname) end), SetECSAction(chinaECS))
 addAction(LuaRule(function(dq) return chinaList:check(dq.qname) end), PoolAction("china"))
 
--- 3. Default: route overseas lookups by source network
+-- 3. Default: route through GeoIP check proxy (keeps source-network ECS)
+--
+-- The proxy at 127.0.0.1:5302 will query overseas DNS, check each resolved IP
+-- against geoip-cn.db, and:
+--   · Non-China IPs → spoof with server IP (traffic enters transparent proxy)
+--   · China IPs     → return normal response (client connects directly)
 addAction(AndRule({privateClientRule, AllRule()}), SetECSOverrideAction(true))
 addAction(AndRule({privateClientRule, AllRule()}), SetECSAction(neutralECSv4, neutralECSv6))
-addAction(AndRule({privateClientRule, AllRule()}), PoolAction("overseas_private"))
+addAction(AndRule({privateClientRule, AllRule()}), PoolAction("overseas"))
 addAction(AndRule({nonPrivateClientRule, AllRule()}), SetECSOverrideAction(true))
 addAction(AndRule({nonPrivateClientRule, AllRule()}), SetECSAction(neutralECSv4, neutralECSv6))
-addAction(AndRule({nonPrivateClientRule, AllRule()}), PoolAction("overseas_public"))
+addAction(AndRule({nonPrivateClientRule, AllRule()}), PoolAction("overseas"))
 
 -- =============================================================================
 -- Cache
@@ -96,21 +110,14 @@ local chinaCache = newPacketCache(__PACKET_CACHE_SIZE__, {
     temporaryFailureTTL=60,
     staleTTL=300
 })
-local privateOverseasCache = newPacketCache(__PACKET_CACHE_SIZE__, {
-    maxTTL=86400,
-    minTTL=300,
-    temporaryFailureTTL=60,
-    staleTTL=300
-})
-local publicOverseasCache = newPacketCache(__PACKET_CACHE_SIZE__, {
+local overseasCache = newPacketCache(__PACKET_CACHE_SIZE__, {
     maxTTL=86400,
     minTTL=300,
     temporaryFailureTTL=60,
     staleTTL=300
 })
 getPool("china"):setCache(chinaCache)
-getPool("overseas_private"):setCache(privateOverseasCache)
-getPool("overseas_public"):setCache(publicOverseasCache)
+getPool("overseas"):setCache(overseasCache)
 
 -- =============================================================================
 -- Web Console / API (optional, local only)

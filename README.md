@@ -41,6 +41,7 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/Xiuyixx/5GPN-X/main/inst
 | sniproxy (dlundquist) | TCP 80/443 | SNI 透明代理（HTTP/HTTPS） |
 | quic-proxy (Go) | UDP 443 | QUIC SNI 透明代理（HTTP/3） |
 | china-dns-race-proxy (Go) | TCP/UDP 127.0.0.1:5301 | ChinaList 上游 DNS 并发竞速与 fallback |
+| overseas-dns-geoip-check (Go) | TCP/UDP 127.0.0.1:5302 | 海外 DNS GeoIP 检查（非中国 IP 自动劫持） |
 | dnsdist (PowerDNS) | TCP/UDP 53, TCP 853 | 智能 DNS + DoT 服务 |
 | Certbot | - | Let's Encrypt 证书自动申请与续期 |
 
@@ -86,10 +87,11 @@ sudo ./install.sh
 - sniproxy (TCP) 编译安装
 - quic-proxy (UDP) 编译安装
 - china-dns-race-proxy 编译安装
+- overseas-dns-geoip-check 编译安装（GeoIP 智能劫持）
 - dnsdist 配置与启动
 - GFWList / ChinaList 规则初始化
 - 系统网络优化（BBR、fq、TCP buffer、conntrack、THP、journald 限制等）
-- 自动续期与规则更新定时任务
+- 自动续期与规则更新定时任务（GeoIP 数据库月度更新）
 
 ### 域名选择
 
@@ -323,6 +325,7 @@ EOF
 | `ios-http.py` | iOS 描述文件按需 HTTP 响应器（socket 激活） |
 | `quic-proxy.go` | QUIC SNI UDP 代理源码 |
 | `china-dns-race-proxy.go` | ChinaList DNS 上游并发竞速代理源码 |
+| `overseas-dns-geoip-check.go` | 海外 DNS GeoIP 劫持代理源码（MMDB 格式） |
 | `sniproxy.conf` | sniproxy 配置文件 |
 | `dnsdist.conf.template` | dnsdist 配置模板 |
 | `update-rules.sh` | GFWList/ChinaList 更新脚本 |
@@ -375,6 +378,19 @@ dnsdist 会先检查来源 IP 和查询端口：
 - 其他来源访问 DoT 时，不做 GFWList 代理劫持，只按 ChinaList / 默认海外 DNS 池正常解析。
 - ChinaList 查询会覆盖 ECS 为 `139.226.48.0/24`，再转发到本机 `china-dns-race-proxy`。
 - `china-dns-race-proxy` 对国内上游做并发查询，默认 `150ms` 后启动国内 TCP 53 重试，默认 `750ms` 后才启动海外 fallback；如果所有上游都失败，会返回 SERVFAIL，避免客户端一直等待无响应 UDP 包。
+
+### 海外 DNS GeoIP 智能劫持
+
+所有非 GFWList/ChinaList 的海外查询走 `overseas-dns-geoip-check`（`127.0.0.1:5302`），这是对 **GFWList 无法覆盖的域名**的补充防御：
+
+- dnsdist 将海外查询转发给 `overseas-dns-geoip-check`（Go 实现）
+- 该代理**并发查询所有的海外上游 DNS**（1.1.1.1、8.8.8.8 等），取最快响应
+- 解析出 A 记录后，逐一查询 **`geoip-cn.db`**（MMDB 格式，来自 [SagerNet/sing-geoip](https://github.com/SagerNet/sing-geoip)）
+- **只要有一个 IP 不在中国 GeoIP 数据库内** → 返回服务器本机 IP（DNS 劫持），使流量进入透明代理
+- **所有 IP 都在中国范围内** → 返回正常 DNS 结果，客户端直连
+- 如果 GeoIP 数据库不可用，自动降级为透传模式（返回正常解析结果）
+
+> 这样即使 GFWList 里缺失某个海外域名，只要它解析到海外 IP，客户端流量也会被自动代理。
 
 ### 系统网络优化
 
